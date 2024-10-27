@@ -28,6 +28,9 @@ DataGol es un proyecto orientado a la categorización de jugadores de fútbol en
    - **Categorías de jugadores basado en sus personalidades de juego**
    - **Esperanza de goles en un partido**
    - **Cambio óptimo de una alineación para maximizar goles esperados**
+
+6.**Conclusion**:
+   Recapitulación del proyecto y detalle de pasos futuros a tomar para mejorarlo.
    
 
 ## Requisitos

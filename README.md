@@ -3,6 +3,8 @@
 **Descripción:**  
 DataGol es un proyecto orientado a la categorización de jugadores de fútbol en base a su estilo de juego. El objetivo principal es identificar una alineación óptima que, dada la alineación del oponente, maximice la esperanza de goles a favor. Este análisis se realiza independientemente del rol típico de los jugadores y se basa en estadísticas detalladas de sus acciones en el campo.
 
+Repositorio creado para el Hackathon: ITAM Sports Hackathon 2024
+
 ---
 
 ## Estructura del Proyecto

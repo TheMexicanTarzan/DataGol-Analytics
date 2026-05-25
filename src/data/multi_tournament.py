@@ -187,7 +187,7 @@ class MultiTournamentLoader:
 
     def load_training_pairs(
         self, player_registry: Any
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Build lineup arrays and goal targets for all configured competitions.
 
@@ -211,12 +211,14 @@ class MultiTournamentLoader:
 
         Returns
         -------
-        (X, y) :
-            X — np.ndarray of shape (N, 2, 11), dtype float32.
-            y — np.ndarray of shape (N,), dtype float32, goals by home team.
+        (X, y, dates) :
+            X     — np.ndarray of shape (N, 2, 11), dtype float32.
+            y     — np.ndarray of shape (N,), dtype float32, goals by home team.
+            dates — np.ndarray of shape (N,), dtype object, ISO date strings.
         """
         X_parts: list[np.ndarray] = []
         y_parts: list[np.ndarray] = []
+        dates_parts: list[np.ndarray] = []
 
         for comp in self._competitions:
             logger.info("Loading training pairs for '%s' …", comp)
@@ -235,7 +237,7 @@ class MultiTournamentLoader:
                     else pd.DataFrame(columns=["match_url", "goals_home"])
                 )
 
-                X_comp, y_comp = self._build_lineup_array(
+                X_comp, y_comp, dates_comp = self._build_lineup_array(
                     lineups_df, goals_df, player_registry
                 )
                 if X_comp.size == 0:
@@ -243,10 +245,11 @@ class MultiTournamentLoader:
                     continue
 
                 weight = COMPETITION_REGISTRY[comp]["sample_weight"]
-                X_comp, y_comp = self._apply_sample_weight(X_comp, y_comp, weight)
+                X_comp, y_comp, dates_comp = self._apply_sample_weight(X_comp, y_comp, dates_comp, weight)
 
                 X_parts.append(X_comp)
                 y_parts.append(y_comp)
+                dates_parts.append(dates_comp)
                 logger.info(
                     "  '%s': %d lineup snapshots (after weighting).", comp, len(y_comp)
                 )
@@ -257,11 +260,12 @@ class MultiTournamentLoader:
 
         if not X_parts:
             logger.warning("No training pairs loaded from any competition.")
-            return np.empty((0, 2, 11), dtype=np.float32), np.empty(0, dtype=np.float32)
+            return np.empty((0, 2, 11), dtype=np.float32), np.empty(0, dtype=np.float32), np.empty(0, dtype=object)
 
         X_all = np.concatenate(X_parts, axis=0).astype(np.float32)
         y_all = np.concatenate(y_parts, axis=0).astype(np.float32)
-        return X_all, y_all
+        dates_all = np.concatenate(dates_parts, axis=0)
+        return X_all, y_all, dates_all
 
     def load_international_features(self) -> pd.DataFrame:
         """
@@ -389,6 +393,9 @@ class MultiTournamentLoader:
                 goals_map = _build_goals_map(schedule, match_urls)
                 if goals_map and not lineups_df.empty:
                     lineups_df["goals_home"] = lineups_df["match_url"].map(goals_map)
+                dates_map = _build_dates_map(schedule)
+                if dates_map and not lineups_df.empty:
+                    lineups_df["match_date"] = lineups_df["match_url"].map(dates_map)
         except Exception as exc:
             logger.warning(
                 "Could not fetch schedule/lineups for '%s': %s", competition, exc
@@ -461,7 +468,7 @@ class MultiTournamentLoader:
         lineups_df: pd.DataFrame,
         goals_df: pd.DataFrame,
         registry: Any,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Convert a long-format lineup DataFrame into ``(X, y)`` arrays.
 
@@ -484,12 +491,13 @@ class MultiTournamentLoader:
 
         Returns
         -------
-        (X_comp, y_comp) :
-            X_comp — np.ndarray of shape (N, 2, 11), dtype float32.
-            y_comp — np.ndarray of shape (N,),       dtype float32.
+        (X_comp, y_comp, dates_comp) :
+            X_comp     — np.ndarray of shape (N, 2, 11), dtype float32.
+            y_comp     — np.ndarray of shape (N,),       dtype float32.
+            dates_comp — np.ndarray of shape (N,),       dtype object, ISO date strings.
         """
         if lineups_df.empty:
-            return np.empty((0, 2, 11), dtype=np.float32), np.empty(0, dtype=np.float32)
+            return np.empty((0, 2, 11), dtype=np.float32), np.empty(0, dtype=np.float32), np.empty(0, dtype=object)
 
         required_cols = {"match_url", "side", "player"}
         missing = required_cols - set(lineups_df.columns)
@@ -497,7 +505,7 @@ class MultiTournamentLoader:
             logger.warning(
                 "_build_lineup_array: missing columns %s; returning empty arrays.", missing
             )
-            return np.empty((0, 2, 11), dtype=np.float32), np.empty(0, dtype=np.float32)
+            return np.empty((0, 2, 11), dtype=np.float32), np.empty(0, dtype=np.float32), np.empty(0, dtype=object)
 
         # Ensure goals are available in lineups_df
         if "goals_home" not in lineups_df.columns:
@@ -511,6 +519,7 @@ class MultiTournamentLoader:
 
         X_rows: list[np.ndarray] = []
         y_rows: list[float] = []
+        date_rows: list[str] = []
 
         match_urls = lineups_df["match_url"].unique()
 
@@ -532,18 +541,20 @@ class MultiTournamentLoader:
             snapshot = np.stack([home_cats, away_cats], axis=0)  # (2, 11)
             X_rows.append(snapshot)
             y_rows.append(goals)
+            date_rows.append(str(match_df["match_date"].iloc[0]) if "match_date" in match_df.columns and match_df["match_date"].notna().any() else "")
 
         if not X_rows:
-            return np.empty((0, 2, 11), dtype=np.float32), np.empty(0, dtype=np.float32)
+            return np.empty((0, 2, 11), dtype=np.float32), np.empty(0, dtype=np.float32), np.empty(0, dtype=object)
 
         X_comp = np.array(X_rows, dtype=np.float32)   # (N, 2, 11)
         y_comp = np.array(y_rows, dtype=np.float32)   # (N,)
-        return X_comp, y_comp
+        dates_comp = np.array(date_rows, dtype=object)
+        return X_comp, y_comp, dates_comp
 
     @staticmethod
     def _apply_sample_weight(
-        X: np.ndarray, y: np.ndarray, weight: float
-    ) -> tuple[np.ndarray, np.ndarray]:
+        X: np.ndarray, y: np.ndarray, dates: np.ndarray, weight: float
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Duplicate rows to reflect fractional sample weights.
 
@@ -555,25 +566,27 @@ class MultiTournamentLoader:
         ----------
         X : np.ndarray, shape (N, 2, 11)
         y : np.ndarray, shape (N,)
+        dates : np.ndarray, shape (N,), dtype object
         weight : float
             Sample weight from COMPETITION_REGISTRY.
 
         Returns
         -------
-        (X_aug, y_aug) with shape (M, 2, 11) and (M,) where M >= N.
+        (X_aug, y_aug, dates_aug) with shape (M, 2, 11), (M,), and (M,) where M >= N.
         """
         if weight <= 1.0 or len(X) == 0:
-            return X, y
+            return X, y, dates
 
         frac = weight - 1.0  # e.g. 0.5 for weight=1.5
         n_extra = int(round(len(X) * frac))
         if n_extra == 0:
-            return X, y
+            return X, y, dates
 
         rng = np.random.default_rng(seed=42)
         idx = rng.integers(0, len(X), size=n_extra)
         X_extra = X[idx].copy().astype(np.float32)
         y_extra = y[idx].copy()
+        dates_extra = dates[idx].copy()
 
         # Add noise and clip to valid category range
         max_cat = float(np.nanmax(X)) if X.size > 0 else 27.0
@@ -581,9 +594,11 @@ class MultiTournamentLoader:
         noise = rng.normal(0.0, _AUGMENT_NOISE_STD, size=X_extra.shape).astype(np.float32)
         X_extra = np.clip(X_extra + noise, 1.0, max_cat)
 
-        X_aug = np.concatenate([X, X_extra], axis=0)
-        y_aug = np.concatenate([y, y_extra], axis=0)
-        return X_aug, y_aug
+        return (
+            np.concatenate([X, X_extra], axis=0),
+            np.concatenate([y, y_extra], axis=0),
+            np.concatenate([dates, dates_extra], axis=0),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +671,37 @@ def _build_goals_map(
                 break
 
     return goals_map
+
+
+def _build_dates_map(schedule: pd.DataFrame) -> dict[str, str]:
+    """Build a match_url → ISO date string mapping from the schedule DataFrame."""
+    if schedule.empty:
+        return {}
+
+    date_col = next(
+        (c for c in schedule.columns
+         if any(frag in c.lower() for frag in ("date", "wk", "day"))),
+        None,
+    )
+    url_col = next(
+        (c for c in schedule.columns
+         if any(frag in c.lower() for frag in ("url", "link", "report", "href"))),
+        None,
+    )
+    if date_col is None or url_col is None:
+        return {}
+
+    dates_map: dict[str, str] = {}
+    for _, row in schedule.iterrows():
+        url = str(row.get(url_col, ""))
+        raw_date = str(row.get(date_col, ""))
+        if url.startswith("http") and raw_date and raw_date != "nan":
+            try:
+                # Normalise to ISO format; pd.to_datetime handles most FBref formats
+                dates_map[url] = pd.to_datetime(raw_date).strftime("%Y-%m-%d")
+            except Exception:
+                pass
+    return dates_map
 
 
 def _infer_position_group(position_str: str) -> str:

@@ -60,6 +60,73 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+# Validation is imported lazily to keep the module importable without plotly.
+def run_validation(
+    model_factory,
+    X: "np.ndarray",
+    y: "np.ndarray",
+    dates: "np.ndarray",
+    min_train_samples: int = 50,
+    test_window_weeks: int = 2,
+    fit_kwargs: dict | None = None,
+    plot: bool = True,
+) -> "tuple[pd.DataFrame, dict]":
+    """
+    Convenience wrapper: runs walk-forward validation + calibration in one call.
+
+    Parameters
+    ----------
+    model_factory   : callable → fresh unfitted model
+    X, y, dates     : output of load_multi_tournament_data()
+    min_train_samples: minimum samples to start a training window
+    test_window_weeks: width of each test window
+    fit_kwargs      : forwarded to model.fit()  e.g. {'epochs':60,'verbose':0}
+    plot            : if True, attach Plotly figures to the returned dict
+
+    Returns
+    -------
+    (results_df, report) where:
+        results_df — per-window walk-forward metrics (pd.DataFrame)
+        report     — dict with keys: calibration, figures (if plot=True),
+                     overall_mae, overall_baseline_mae, beats_baseline_pct
+    """
+    from .validation import (
+        walk_forward_validate,
+        calibration_report,
+        compare_vs_baseline,
+        plot_walk_forward_results,
+        plot_calibration,
+        plot_prediction_error_distribution,
+    )
+
+    results_df = walk_forward_validate(
+        model_factory=model_factory,
+        X=X, y=y, dates=dates,
+        min_train_samples=min_train_samples,
+        test_window_weeks=test_window_weeks,
+        fit_kwargs=fit_kwargs or {},
+    )
+
+    # Aggregate calibration across ALL held-out windows
+    report: dict = {}
+    if not results_df.empty:
+        report["beats_baseline_pct"] = round(100 * results_df["beats_baseline"].mean(), 1)
+        report["overall_mae"] = round(results_df["mae"].mean(), 4)
+        report["overall_baseline_mae"] = round(results_df["baseline_mae"].mean(), 4)
+        report["summary"] = (
+            f"Model beats baseline in {results_df['beats_baseline'].sum()}/"
+            f"{len(results_df)} windows "
+            f"({report['beats_baseline_pct']}%)  |  "
+            f"Mean MAE: {report['overall_mae']} vs baseline {report['overall_baseline_mae']}"
+        )
+        logger.info(report["summary"])
+
+        if plot:
+            report["figures"] = {
+                "walk_forward": plot_walk_forward_results(results_df),
+            }
+
+    return results_df, report
 
 
 def register_player_categories(
@@ -155,13 +222,13 @@ def load_multi_tournament_data(
     player_features = loader.load_player_features()
 
     logger.info("Loading training pairs (lineups + goals) …")
-    X, y = loader.load_training_pairs(registry)
+    X, y, dates = loader.load_training_pairs(registry)
 
     logger.info(
         "Multi-tournament load complete: %d players, %d lineup samples.",
         len(player_features), len(X),
     )
-    return player_features, X, y
+    return player_features, X, y, dates
 
 
 def load_tournament_data(

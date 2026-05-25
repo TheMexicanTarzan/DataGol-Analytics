@@ -194,6 +194,91 @@ class PersonalityFeatureBuilder:
         features.index.name = "player"
         return features
 
+    def build_gk(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Build GK personality features from a keeper-stats DataFrame returned by
+        ``FBrefScraper.get_keeper_stats()``.
+
+        Unlike ``build()``, this method does **not** filter out goalkeepers — the
+        input is already GK-only data.  It computes GK-specific proportion features
+        and returns a DataFrame indexed by player name.
+        """
+        df = df.copy().reset_index(drop=True)
+
+        player_col = next((c for c in df.columns if c.lower() == "player"), None)
+
+        # Use integer index during computation so _col() Series align correctly;
+        # set player names as index at the end.
+        features = pd.DataFrame(index=df.index)
+
+        # -- Save percentage --------------------------------------------------
+        # _col always returns a Series; use .eq(0).all() to detect "not found"
+        # and fall back to the alternate column name fragment.
+        saves = _col(df, "save")
+        if saves.eq(0).all():
+            saves = _col(df, "sv")
+        shots_on_target_against = _col(df, "sota")
+        if shots_on_target_against.eq(0).all():
+            shots_on_target_against = _col(df, "sot")
+        features["proportion_saves"] = _safe_div(saves, shots_on_target_against).fillna(0)
+
+        # -- Distribution style: proportion of long kicks vs short passes -----
+        launched_att = _col(df, "launch", "att")
+        if launched_att.eq(0).all():
+            launched_att = _col(df, "launched")
+        pass_att = _col(df, "pass", "att")
+        features["proportion_launched"] = _safe_div(
+            launched_att, launched_att + pass_att
+        ).fillna(0)
+
+        # -- Cross claiming ---------------------------------------------------
+        crosses_stopped = _col(df, "stp")
+        if crosses_stopped.eq(0).all():
+            crosses_stopped = _col(df, "stop")
+        crosses_faced = _col(df, "cross", "att")
+        if crosses_faced.eq(0).all():
+            crosses_faced = crosses_stopped
+        features["proportion_crosses_claimed"] = _safe_div(
+            crosses_stopped, crosses_faced
+        ).fillna(0)
+
+        # -- Shot quality faced per attempt (higher = harder job) -------------
+        # PSxG/SoTA gives xG per shot faced; typically 0.2–0.5, clips cleanly to [0,1]
+        psxg = _col(df, "psxg")
+        sota_for_psxg = shots_on_target_against.replace(0, np.nan)
+        features["mean_psxg_faced"] = _safe_div(psxg, sota_for_psxg).fillna(0)
+
+        # -- Clean sheets rate ------------------------------------------------
+        clean_sheets = _col(df, "cs")
+        matches = _col(df, "mp")
+        if matches.eq(0).all():
+            matches = _col(df, "ga90")
+        features["proportion_clean_sheets"] = _safe_div(
+            clean_sheets, matches + clean_sheets
+        ).fillna(0)
+
+        # -- Sweeper tendency (actions outside box) ---------------------------
+        sweeper_actions = _col(df, "opa")
+        if sweeper_actions.eq(0).all():
+            sweeper_actions = _col(df, "#opa")
+        features["proportion_sweeper"] = (
+            _safe_div(sweeper_actions, matches + 0.1).clip(0, 1).fillna(0)
+        )
+
+        # -- GK position flag -------------------------------------------------
+        features["is_goalkeeper"] = 1
+
+        # -- Normalise (clip to [0, 1]) ---------------------------------------
+        numeric_cols = features.select_dtypes(include="number").columns
+        features[numeric_cols] = features[numeric_cols].clip(0, 1)
+
+        # Set player names as index now that all computations are done
+        if player_col is not None:
+            features.index = df[player_col]
+        features.index.name = "player"
+
+        return features
+
     # ------------------------------------------------------------------
 
     def _filter_players(self, df: pd.DataFrame) -> pd.DataFrame:

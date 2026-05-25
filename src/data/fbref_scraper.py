@@ -35,6 +35,10 @@ CompetitionKey = Literal[
     "euro_2024",
     "bundesliga_2024",
     "premier_league_2024",
+    "champions_league_2324",
+    "premier_league_2324",
+    "bundesliga_2324",
+    "la_liga_2324",
 ]
 
 # Direct FBref competition stats URLs (no auth required)
@@ -43,6 +47,10 @@ FBREF_COMP_URLS: dict[str, str] = {
     "world_cup_2022": "https://fbref.com/en/comps/1/2022/2022-World-Cup-Stats",
     "copa_america_2024": "https://fbref.com/en/comps/685/2024/2024-Copa-America-Stats",
     "euro_2024": "https://fbref.com/en/comps/676/2024/2024-UEFA-Euro-Stats",
+    "champions_league_2324": "https://fbref.com/en/comps/8/2023-2024/2023-2024-Champions-League-Stats",
+    "premier_league_2324": "https://fbref.com/en/comps/9/2023-2024/2023-2024-Premier-League-Stats",
+    "bundesliga_2324": "https://fbref.com/en/comps/20/2023-2024/2023-2024-Bundesliga-Stats",
+    "la_liga_2324": "https://fbref.com/en/comps/12/2023-2024/2023-2024-La-Liga-Stats",
 }
 
 # soccerdata (FBref wrapper) identifiers
@@ -53,6 +61,10 @@ SOCCERDATA_MAP: dict[str, tuple[str, str]] = {
     "euro_2024": ("UEFA Euro", "2024"),
     "bundesliga_2024": ("Bundesliga", "2024"),
     "premier_league_2024": ("Premier League", "2024"),
+    "champions_league_2324": ("UEFA Champions League", "2023-2024"),
+    "premier_league_2324": ("ENG-Premier League", "2023-2024"),
+    "bundesliga_2324": ("GER-Bundesliga", "2023-2024"),
+    "la_liga_2324": ("ESP-La Liga", "2023-2024"),
 }
 
 # Table IDs on FBref stats pages (used in the direct HTML scraper)
@@ -64,6 +76,8 @@ STAT_TABLE_IDS: dict[str, str] = {
     "defense": "stats_defense",
     "possession": "stats_possession",
     "misc": "stats_misc",
+    "keeper": "stats_keeper",
+    "keeper_adv": "stats_keeper_adv",
 }
 
 _HEADERS = {
@@ -161,6 +175,56 @@ class _DirectFBrefScraper:
                 logger.warning("Skipping '%s' stats: %s", stat, exc)
         return stats
 
+    def get_keeper_stats(self, competition: str) -> pd.DataFrame:
+        """
+        Scrape GK-specific stat tables from the FBref goalkeeping page.
+
+        FBref hosts keeper tables at a separate URL — replace ``/stats/`` with
+        ``/goalkeeping/`` in the competition base URL.  Both ``stats_keeper`` and
+        ``stats_keeper_adv`` are fetched and merged on the ``Player`` column.
+        """
+        base_url = FBREF_COMP_URLS.get(competition)
+        if base_url is None:
+            raise ValueError(
+                f"Unknown competition '{competition}'. "
+                f"Available: {list(FBREF_COMP_URLS)}"
+            )
+        keeper_url = base_url.replace("/stats/", "/goalkeeping/")
+
+        logger.info("Scraping FBref keeper stats for %s …", competition)
+        html = self._get(keeper_url)
+        html = _uncomment_html(html)
+        soup = BeautifulSoup(html, "lxml")
+
+        frames: list[pd.DataFrame] = []
+        for table_key in ("keeper", "keeper_adv"):
+            table_id = STAT_TABLE_IDS[table_key]
+            table = soup.find("table", {"id": table_id})
+            if table is None:
+                logger.warning("GK table '%s' not found at %s", table_id, keeper_url)
+                continue
+            df = pd.read_html(StringIO(str(table)), header=[0, 1])[0]
+            frames.append(_clean_player_table(df))
+
+        if not frames:
+            raise ValueError(f"No keeper tables found at {keeper_url}")
+
+        if len(frames) == 1:
+            return frames[0]
+
+        # Merge keeper and keeper_adv on Player column (left join on keeper)
+        left, right = frames[0], frames[1]
+        player_col_left = next(
+            (c for c in left.columns if c.lower() == "player"), None
+        )
+        player_col_right = next(
+            (c for c in right.columns if c.lower() == "player"), None
+        )
+        if player_col_left is None or player_col_right is None:
+            return left  # fallback: just return the first table
+
+        return left.merge(right, left_on=player_col_left, right_on=player_col_right, how="left")
+
     def get_schedule(self, competition: str) -> pd.DataFrame:
         """Scrape match schedule/results table."""
         base_url = FBREF_COMP_URLS.get(competition, "")
@@ -238,6 +302,41 @@ class _SoccerdataFBrefScraper:
             except Exception as exc:
                 logger.warning("soccerdata failed for '%s': %s", stat, exc)
         return stats
+
+    def get_keeper_stats(self, competition: str) -> pd.DataFrame:
+        """
+        Fetch GK stats via soccerdata using stat_type='keeper' and 'keeper_adv'.
+        Both DataFrames are merged on the player column.
+        """
+        league, season = SOCCERDATA_MAP[competition]
+        fbref = self._sd.FBref(leagues=league, seasons=season)
+
+        frames: list[pd.DataFrame] = []
+        for stat_type in ("keeper", "keeper_adv"):
+            logger.info("soccerdata fetching '%s' for %s …", stat_type, competition)
+            try:
+                df = fbref.read_player_season_stats(stat_type=stat_type)
+                frames.append(_clean_player_table(_flatten_columns(df.reset_index())))
+            except Exception as exc:
+                logger.warning("soccerdata failed for '%s': %s", stat_type, exc)
+
+        if not frames:
+            raise ValueError(f"soccerdata returned no keeper data for {competition}")
+
+        if len(frames) == 1:
+            return frames[0]
+
+        left, right = frames[0], frames[1]
+        player_col_left = next(
+            (c for c in left.columns if c.lower() == "player"), None
+        )
+        player_col_right = next(
+            (c for c in right.columns if c.lower() == "player"), None
+        )
+        if player_col_left is None or player_col_right is None:
+            return left
+
+        return left.merge(right, left_on=player_col_left, right_on=player_col_right, how="left")
 
     def get_schedule(self, competition: str) -> pd.DataFrame:
         league, season = SOCCERDATA_MAP[competition]
@@ -324,6 +423,33 @@ class FBrefScraper:
         merged = self._merge_stat_tables(raw)
         self._cache.set(cache_key, merged)
         return merged
+
+    def get_keeper_stats(self) -> pd.DataFrame:
+        """
+        Fetch goalkeeper-specific stats for the competition.
+
+        GK tables (``stats_keeper`` and ``stats_keeper_adv``) live on the
+        FBref goalkeeping page — a separate URL from the outfield stats page.
+        Results are cached to disk; re-fetched when TTL expires.
+
+        Returns a single merged DataFrame with one row per goalkeeper.
+        """
+        cache_key = f"{self.competition}_keeper_stats"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if self._soccerdata and self.competition in SOCCERDATA_MAP:
+            try:
+                df = self._soccerdata.get_keeper_stats(self.competition)
+                self._cache.set(cache_key, df)
+                return df
+            except Exception as exc:
+                logger.warning("soccerdata keeper stats failed, falling back to direct: %s", exc)
+
+        df = self._direct.get_keeper_stats(self.competition)
+        self._cache.set(cache_key, df)
+        return df
 
     def get_schedule(self) -> pd.DataFrame:
         """Fetch match schedule and results for the competition."""

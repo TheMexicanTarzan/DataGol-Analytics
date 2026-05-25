@@ -43,9 +43,12 @@ import numpy as np
 import pandas as pd
 
 from .data import (
+    COMPETITION_REGISTRY,
     DataCache,
     FBrefScraper,
+    MultiTournamentLoader,
     PersonalityFeatureBuilder,
+    PlayerRegistry,
     QualityScoreBuilder,
     SofascoreScraper,
     TransfermarktScraper,
@@ -57,6 +60,108 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
+
+
+def register_player_categories(
+    clusts_total: pd.DataFrame,
+    competition: str,
+    db_path: Path = Path("data/player_registry.db"),
+) -> PlayerRegistry:
+    """
+    Persist clustering results from the notebook into the PlayerRegistry.
+
+    Call this once after running the clustering cells in DataGol.ipynb so that
+    future runs can resolve player → category without re-clustering.
+
+    Parameters
+    ----------
+    clusts_total : pd.DataFrame
+        Combined cluster assignments with columns: player_name (or player),
+        category, position_group.  This is the DataFrame produced after
+        concatenating clust_back_df, clust_midfield_df, clust_forward_df.
+    competition  : str  e.g. 'copa_america_2024'
+    db_path      : Path  where to store the SQLite registry
+
+    Returns
+    -------
+    PlayerRegistry  (populated and ready to use)
+    """
+    registry = PlayerRegistry(db_path=db_path)
+
+    df = clusts_total.copy()
+    name_col = next((c for c in df.columns if "player" in c.lower() and "id" not in c.lower()), None)
+    if name_col and name_col != "player_name":
+        df = df.rename(columns={name_col: "player_name"})
+
+    if "position_group" not in df.columns:
+        # Infer from category ranges used in the notebook (1-7=def, 8-17=mid, 18-23=fwd, 24+=GK)
+        def _infer(cat: int) -> str:
+            if cat <= 7:
+                return "defender"
+            if cat <= 17:
+                return "midfielder"
+            if cat <= 23:
+                return "forward"
+            return "goalkeeper"
+        df["position_group"] = df["category"].apply(_infer)
+
+    registry.register_bulk(df[["player_name", "category", "position_group"]], competition)
+    logger.info("Registered %d players from %s into registry.", len(df), competition)
+    return registry
+
+
+def load_multi_tournament_data(
+    competitions: list[str] | None = None,
+    international_only: bool = False,
+    cache_dir: Path = Path("data/cache"),
+    db_path: Path = Path("data/player_registry.db"),
+    request_delay: float = 4.0,
+) -> tuple[pd.DataFrame, "np.ndarray", "np.ndarray"]:
+    """
+    Fetch and combine data from multiple competitions for model retraining.
+
+    Replaces the single-tournament ``load_tournament_data`` when you want to
+    expand the training set beyond 248 Copa América samples.
+
+    Parameters
+    ----------
+    competitions     : list of competition keys; None = all in COMPETITION_REGISTRY
+    international_only : if True, skip club leagues (use for personality clustering)
+    cache_dir        : parquet cache (historical comps use ttl_hours=720)
+    db_path          : PlayerRegistry SQLite path (must be pre-populated via
+                       ``register_player_categories`` after the clustering notebook runs)
+    request_delay    : seconds between HTTP requests (be polite to FBref)
+
+    Returns
+    -------
+    player_features : pd.DataFrame
+        Combined feature matrix (all players × personality features), ready for
+        re-clustering.  Includes `competition` and `sample_weight` columns.
+    X : np.ndarray, shape (N, 2, 11)
+        Lineup arrays for training.  Axis 2 = [GK, 10 outfield], values = category IDs.
+    y : np.ndarray, shape (N,)
+        Goals scored by the home team per lineup snapshot.
+    """
+    registry = PlayerRegistry(db_path=db_path)
+    loader = MultiTournamentLoader(
+        competitions=competitions,
+        cache_dir=cache_dir,
+        ttl_hours=720,
+        request_delay=request_delay,
+        international_only=international_only,
+    )
+
+    logger.info("Loading player features from multiple competitions …")
+    player_features = loader.load_player_features()
+
+    logger.info("Loading training pairs (lineups + goals) …")
+    X, y = loader.load_training_pairs(registry)
+
+    logger.info(
+        "Multi-tournament load complete: %d players, %d lineup samples.",
+        len(player_features), len(X),
+    )
+    return player_features, X, y
 
 
 def load_tournament_data(

@@ -1,23 +1,62 @@
 """
-DataGol data pipeline — drop-in replacement for the StatsBomb API calls.
+DataGol pipeline — orchestrates data fetching, personality clustering,
+quality scoring, and two-layer matchup prediction.
 
-Produces the same two objects that the DataGol notebook uses downstream:
-  - model_df          : player feature matrix (for clustering)
-  - copa_america_lineups : lineup DataFrame (for matchup prediction)
+Two-layer model
+---------------
+  Layer 1 (personality matchup):
+      Neural network predicts xG purely from lineup personality categories.
+      This is what the original DataGol notebook trained.
 
-Usage (notebook cell):
-    from src.pipeline import load_tournament_data
+  Layer 2 (quality adjustment):
+      Scales the Layer-1 prediction by a quality ratio derived from
+      Transfermarkt values + FBref percentiles + Sofascore live ratings.
+
+      home_xg_adjusted = home_xg_raw * quality_multiplier(home, away)
+      away_xg_adjusted = away_xg_raw * quality_multiplier(away, home)
+
+      The multiplier uses tanh so extreme quality gaps produce large but
+      bounded adjustments. At equal quality both multipliers equal 1.0.
+
+Quick start (notebook cell)
+---------------------------
+    from src.pipeline import load_tournament_data, load_quality_scores, predict_matchup
+
     model_df, lineups_df = load_tournament_data("world_cup_2026")
+    quality_df           = load_quality_scores("world_cup_2026")
+
+    result = predict_matchup(
+        model        = trained_model,       # keras model from notebook
+        home_lineup  = [3, 7, 7, 2, 15, 15, 9, 12, 20, 21],   # personality IDs
+        away_lineup  = [4, 6, 6, 1, 14, 16, 8, 11, 19, 22],
+        home_players = ["Messi", "De Paul", ...],               # for quality lookup
+        away_players = ["Mbappé", "Griezmann", ...],
+        quality_df   = quality_df,
+    )
+    print(result)
 """
 
 import logging
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from .data import DataCache, FBrefScraper, PersonalityFeatureBuilder
+from .data import (
+    DataCache,
+    FBrefScraper,
+    PersonalityFeatureBuilder,
+    QualityScoreBuilder,
+    SofascoreScraper,
+    TransfermarktScraper,
+)
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
 
 
 def load_tournament_data(
@@ -29,29 +68,14 @@ def load_tournament_data(
     """
     Fetch, clean, and featurise all player data for the given tournament.
 
-    Parameters
-    ----------
-    competition : str
-        One of: world_cup_2026, world_cup_2022, copa_america_2024, euro_2024
-    cache_dir : Path
-        Where to store cached parquet files (avoids re-scraping).
-    ttl_hours : int
-        Cache time-to-live. Use 6 during the tournament, 720 for historical.
-    min_minutes : int
-        Minimum minutes played to include a player.
-
     Returns
     -------
     model_df : pd.DataFrame
         Feature matrix (players × personality features), ready for clustering.
     lineups_df : pd.DataFrame
-        Long-format lineups: columns [match_id, team, player, position].
+        Long-format lineups: [match_url, side, player, ...].
     """
-    scraper = FBrefScraper(
-        competition=competition,
-        cache_dir=cache_dir,
-        ttl_hours=ttl_hours,
-    )
+    scraper = FBrefScraper(competition=competition, cache_dir=cache_dir, ttl_hours=ttl_hours)
     builder = PersonalityFeatureBuilder()
     builder.MIN_MINUTES = min_minutes
 
@@ -68,24 +92,233 @@ def load_tournament_data(
     match_urls = _extract_match_urls(schedule)
     lineups_df = scraper.get_all_lineups(match_urls)
 
-    logger.info(
-        "Pipeline complete: %d players, %d lineup records.",
-        len(model_df),
-        len(lineups_df),
-    )
+    logger.info("Pipeline complete: %d players, %d lineup records.", len(model_df), len(lineups_df))
     return model_df, lineups_df
 
 
+def load_quality_scores(
+    competition: str = "world_cup_2026",
+    fbref_stats: pd.DataFrame | None = None,
+    cache_dir: Path = Path("data/cache"),
+    ttl_hours: int = 6,
+    w_transfermarkt: float = 0.40,
+    w_fbref: float = 0.30,
+    w_sofascore: float = 0.30,
+) -> pd.DataFrame:
+    """
+    Fetch and combine quality scores from Transfermarkt, FBref, and Sofascore.
+
+    Parameters
+    ----------
+    competition   : tournament key (e.g. 'world_cup_2026')
+    fbref_stats   : pre-fetched merged FBref stats; re-fetched if None
+    cache_dir     : parquet cache directory
+    ttl_hours     : cache TTL (use 6 during the tournament)
+    w_transfermarkt / w_fbref / w_sofascore : source weights (must sum to 1)
+
+    Returns
+    -------
+    DataFrame indexed by player name with columns:
+      quality_score, tm_score, fbref_score, sofascore_score,
+      market_value_eur, sofascore_rating, appearances, position_group
+    """
+    cache = DataCache(cache_dir=cache_dir, ttl_hours=ttl_hours)
+    cache_key = f"{competition}_quality_scores"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    # FBref stats (reuse if already loaded)
+    if fbref_stats is None:
+        scraper = FBrefScraper(competition=competition, cache_dir=cache_dir, ttl_hours=ttl_hours)
+        fbref_stats = scraper.get_merged_player_stats()
+
+    # Transfermarkt
+    tm_values: pd.DataFrame | None = None
+    try:
+        logger.info("Fetching Transfermarkt values for '%s' …", competition)
+        tm_scraper = TransfermarktScraper()
+        tm_values = tm_scraper.get_player_values(competition)
+        logger.info("Transfermarkt: %d players", len(tm_values))
+    except Exception as exc:
+        logger.warning("Transfermarkt fetch failed (continuing without it): %s", exc)
+
+    # Sofascore
+    sofascore_ratings: pd.DataFrame | None = None
+    try:
+        logger.info("Fetching Sofascore ratings for '%s' …", competition)
+        sof_scraper = SofascoreScraper()
+        sofascore_ratings = sof_scraper.get_player_ratings(competition)
+        logger.info("Sofascore: %d players", len(sofascore_ratings))
+    except Exception as exc:
+        logger.warning("Sofascore fetch failed (continuing without it): %s", exc)
+
+    builder = QualityScoreBuilder(
+        w_transfermarkt=w_transfermarkt,
+        w_fbref=w_fbref,
+        w_sofascore=w_sofascore,
+    )
+    quality_df = builder.build(
+        fbref_stats=fbref_stats,
+        tm_values=tm_values,
+        sofascore_ratings=sofascore_ratings,
+    )
+
+    cache.set(cache_key, quality_df.reset_index())
+    logger.info("Quality scores built for %d players.", len(quality_df))
+    return quality_df
+
+
+# ---------------------------------------------------------------------------
+# Two-layer matchup prediction
+# ---------------------------------------------------------------------------
+
+
+def predict_matchup(
+    model,
+    home_lineup: list[int],
+    away_lineup: list[int],
+    home_players: list[str] | None = None,
+    away_players: list[str] | None = None,
+    quality_df: pd.DataFrame | None = None,
+    quality_sensitivity: float = 1.5,
+) -> dict:
+    """
+    Predict expected goals for a head-to-head matchup.
+
+    Layer 1 uses the trained neural network (personality matchup only).
+    Layer 2 adjusts for team quality when quality_df and player names are given.
+
+    Parameters
+    ----------
+    model            : trained Keras model (from DataGol notebook)
+    home_lineup      : list of 10 personality category IDs for the home team
+    away_lineup      : list of 10 personality category IDs for the away team
+    home_players     : player names in same order as home_lineup (optional)
+    away_players     : player names in same order as away_lineup (optional)
+    quality_df       : output of load_quality_scores()  (optional)
+    quality_sensitivity : tanh steepness; higher = larger quality effect
+
+    Returns
+    -------
+    dict with keys:
+      raw_home_xg        — Layer-1 prediction (personality only)
+      raw_away_xg
+      adjusted_home_xg   — Layer-2 prediction (personality + quality)
+      adjusted_away_xg
+      quality_adjustment — multiplier applied to home team (>1 = home favoured)
+      home_win_prob      — P(home goals > away goals) from adjusted predictions
+      expected_goal_diff — adjusted_home_xg - adjusted_away_xg
+    """
+    # Layer 1: personality matchup
+    home_arr = np.array(home_lineup, dtype=float).reshape(1, 1, 10)
+    away_arr = np.array(away_lineup, dtype=float).reshape(1, 1, 10)
+    lineup_input = np.concatenate([home_arr, away_arr], axis=1)  # (1, 2, 10)
+
+    raw_home_xg = float(model.predict(lineup_input, verbose=0)[0][0])
+
+    away_input = np.concatenate([away_arr, home_arr], axis=1)
+    raw_away_xg = float(model.predict(away_input, verbose=0)[0][0])
+
+    # Layer 2: quality adjustment
+    adj = 1.0
+    if quality_df is not None and home_players and away_players:
+        adj = _quality_multiplier(
+            home_players, away_players, quality_df, quality_sensitivity
+        )
+
+    adjusted_home_xg = raw_home_xg * adj
+    adjusted_away_xg = raw_away_xg * (2.0 - adj)  # symmetric: equal adj pushes to 1.0
+
+    # Win probability (Poisson approximation)
+    home_win_p = _poisson_win_prob(adjusted_home_xg, adjusted_away_xg)
+    away_win_p = _poisson_win_prob(adjusted_away_xg, adjusted_home_xg)
+    draw_p = max(0.0, 1.0 - home_win_p - away_win_p)
+
+    return {
+        "raw_home_xg": round(raw_home_xg, 3),
+        "raw_away_xg": round(raw_away_xg, 3),
+        "adjusted_home_xg": round(adjusted_home_xg, 3),
+        "adjusted_away_xg": round(adjusted_away_xg, 3),
+        "quality_adjustment": round(adj, 4),
+        "home_win_prob": round(home_win_p, 3),
+        "draw_prob": round(draw_p, 3),
+        "away_win_prob": round(away_win_p, 3),
+        "expected_goal_diff": round(adjusted_home_xg - adjusted_away_xg, 3),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _quality_multiplier(
+    home_players: list[str],
+    away_players: list[str],
+    quality_df: pd.DataFrame,
+    sensitivity: float,
+) -> float:
+    """
+    Compute the quality adjustment multiplier for the home team.
+
+    multiplier = 1 + tanh(sensitivity * (q_home - q_away) / (q_home + q_away))
+
+    At equal quality: multiplier = 1.0  (no adjustment)
+    Home much stronger: multiplier → 2.0 (double xG)
+    Home much weaker:   multiplier → 0.0 (halved xG)
+    """
+    idx = quality_df.index.tolist()
+
+    def avg_quality(players: list[str]) -> float:
+        scores = []
+        for name in players:
+            from difflib import get_close_matches
+            import unicodedata
+
+            def _norm(s):
+                nfkd = unicodedata.normalize("NFKD", str(s))
+                return " ".join(nfkd.encode("ascii", "ignore").decode().lower().split())
+
+            matches = get_close_matches(_norm(name), [_norm(i) for i in idx], n=1, cutoff=0.75)
+            if matches:
+                orig = idx[[_norm(i) for i in idx].index(matches[0])]
+                scores.append(quality_df.loc[orig, "quality_score"])
+        return float(np.mean(scores)) if scores else 0.5
+
+    q_home = avg_quality(home_players)
+    q_away = avg_quality(away_players)
+
+    denom = q_home + q_away
+    if denom < 1e-8:
+        return 1.0
+
+    ratio = (q_home - q_away) / denom
+    multiplier = 1.0 + float(np.tanh(sensitivity * ratio))
+    return float(np.clip(multiplier, 0.1, 1.9))  # safety bounds
+
+
+def _poisson_win_prob(lambda_a: float, lambda_b: float, max_goals: int = 10) -> float:
+    """P(Poisson(lambda_a) > Poisson(lambda_b)) via exact sum."""
+    from math import exp, factorial
+
+    def pmf(lam: float, k: int) -> float:
+        return exp(-lam) * (lam ** k) / factorial(k)
+
+    prob = 0.0
+    for a in range(1, max_goals + 1):
+        for b in range(0, a):
+            prob += pmf(lambda_a, a) * pmf(lambda_b, b)
+    return float(np.clip(prob, 0.0, 1.0))
+
+
 def _extract_match_urls(schedule: pd.DataFrame) -> list[str]:
-    """Extract FBref match report URLs from the schedule DataFrame."""
     url_col = next(
-        (c for c in schedule.columns if "url" in c.lower() or "report" in c.lower()),
-        None,
+        (c for c in schedule.columns if "url" in c.lower() or "report" in c.lower()), None
     )
     if url_col is None:
         logger.warning("No match URL column found in schedule. Lineup scraping skipped.")
         return []
-
     base = "https://fbref.com"
     urls = schedule[url_col].dropna().tolist()
     return [u if u.startswith("http") else f"{base}{u}" for u in urls]

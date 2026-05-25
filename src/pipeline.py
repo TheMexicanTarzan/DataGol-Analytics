@@ -421,6 +421,225 @@ def predict_matchup(
 
 
 # ---------------------------------------------------------------------------
+# Phase 3.2 — Confidence intervals
+# ---------------------------------------------------------------------------
+
+
+def predict_with_confidence(
+    model,
+    home_lineup: list[int],
+    away_lineup: list[int],
+    home_players: list[str] | None = None,
+    away_players: list[str] | None = None,
+    quality_df: pd.DataFrame | None = None,
+    quality_sensitivity: float = 1.5,
+    mae_estimate: float | None = None,
+    model_ensemble: list | None = None,
+    confidence_level: float = 0.90,
+) -> dict:
+    """
+    Like ``predict_matchup`` but adds prediction intervals to every xG and
+    probability field.
+
+    Interval strategy (choose one):
+
+    A) ``model_ensemble`` provided — run each model, take percentiles.
+       Most accurate; requires N trained models (e.g. from different training
+       folds or bootstrap samples).
+
+    B) ``mae_estimate`` provided — Gaussian approximation around the point
+       estimate using the MAE from walk-forward validation as the scale.
+       Faster; use ``run_validation()`` results to get a realistic MAE.
+
+    C) Neither provided — returns the plain ``predict_matchup`` result with
+       ``*_low`` / ``*_high`` fields set to the point estimate (no interval).
+
+    Parameters
+    ----------
+    model           : primary trained model (used for the point estimate)
+    mae_estimate    : float, optional — MAE from walk-forward validation;
+                      90% CI half-width ≈ 1.645 * MAE
+    model_ensemble  : list of trained models, optional — used for interval
+                      estimation; overrides mae_estimate if both are provided
+    confidence_level: float in (0,1), default 0.90 — CI coverage
+
+    Returns
+    -------
+    All keys from ``predict_matchup`` plus:
+        adjusted_home_xg_low / _high
+        adjusted_away_xg_low / _high
+        home_win_prob_low / _high
+        away_win_prob_low / _high
+        draw_prob_low / _high
+        ci_method  : 'ensemble' | 'gaussian' | 'none'
+    """
+    base = predict_matchup(
+        model, home_lineup, away_lineup,
+        home_players, away_players, quality_df, quality_sensitivity,
+    )
+
+    alpha = (1.0 - confidence_level) / 2.0  # tail probability on each side
+    h_xg = base["adjusted_home_xg"]
+    a_xg = base["adjusted_away_xg"]
+
+    if model_ensemble:
+        h_preds, a_preds = [], []
+        for m in model_ensemble:
+            r = predict_matchup(m, home_lineup, away_lineup,
+                                home_players, away_players, quality_df, quality_sensitivity)
+            h_preds.append(r["adjusted_home_xg"])
+            a_preds.append(r["adjusted_away_xg"])
+        h_low  = float(np.quantile(h_preds, alpha))
+        h_high = float(np.quantile(h_preds, 1 - alpha))
+        a_low  = float(np.quantile(a_preds, alpha))
+        a_high = float(np.quantile(a_preds, 1 - alpha))
+        ci_method = "ensemble"
+
+    elif mae_estimate is not None:
+        from scipy.stats import norm
+        z = norm.ppf(1 - alpha)  # e.g. 1.645 for 90%
+        half = z * float(mae_estimate)
+        h_low, h_high = max(0.0, h_xg - half), h_xg + half
+        a_low, a_high = max(0.0, a_xg - half), a_xg + half
+        ci_method = "gaussian"
+
+    else:
+        h_low = h_high = h_xg
+        a_low = a_high = a_xg
+        ci_method = "none"
+
+    def _probs(hxg, axg):
+        hp = _poisson_win_prob(hxg, axg)
+        ap = _poisson_win_prob(axg, hxg)
+        return round(hp, 3), round(max(0.0, 1 - hp - ap), 3), round(ap, 3)
+
+    hw_lo, dr_lo, aw_lo = _probs(h_low,  a_high)  # pessimistic for home
+    hw_hi, dr_hi, aw_hi = _probs(h_high, a_low)   # optimistic for home
+
+    return {
+        **base,
+        "adjusted_home_xg_low":  round(h_low,  3),
+        "adjusted_home_xg_high": round(h_high, 3),
+        "adjusted_away_xg_low":  round(a_low,  3),
+        "adjusted_away_xg_high": round(a_high, 3),
+        "home_win_prob_low":  min(hw_lo, hw_hi),
+        "home_win_prob_high": max(hw_lo, hw_hi),
+        "draw_prob_low":  min(dr_lo, dr_hi),
+        "draw_prob_high": max(dr_lo, dr_hi),
+        "away_win_prob_low":  min(aw_lo, aw_hi),
+        "away_win_prob_high": max(aw_lo, aw_hi),
+        "ci_method":   ci_method,
+        "confidence_level": confidence_level,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 3.3 — Betting signal + Kelly Criterion
+# ---------------------------------------------------------------------------
+
+
+def betting_signal(
+    matchup_result: dict,
+    home_odds: float,
+    draw_odds: float,
+    away_odds: float,
+    kelly_fraction: float = 0.25,
+    min_edge: float = 0.05,
+) -> dict:
+    """
+    Translate a matchup prediction into actionable betting signals.
+
+    The bookmaker margin is removed before computing edges so the comparison
+    is fair: model probability vs the true implied probability (not the raw
+    inverse of the odds).
+
+    Parameters
+    ----------
+    matchup_result  : dict — output of predict_matchup() or
+                      predict_with_confidence()
+    home_odds       : decimal odds for home win  (e.g. 2.50)
+    draw_odds       : decimal odds for draw      (e.g. 3.20)
+    away_odds       : decimal odds for away win  (e.g 2.80)
+    kelly_fraction  : fractional Kelly multiplier (0.25 = quarter-Kelly)
+    min_edge        : minimum edge to emit a signal; filters noise
+
+    Returns
+    -------
+    dict with keys:
+      bookmaker_margin  : vig as a fraction (e.g. 0.05 = 5%)
+      signals           : list[dict] — one per outcome with positive edge,
+                          sorted by edge descending. Each signal has:
+                            outcome         : 'home' | 'draw' | 'away'
+                            model_prob      : float
+                            fair_prob       : float  (margin-removed)
+                            decimal_odds    : float
+                            edge            : model_prob - fair_prob
+                            full_kelly      : float
+                            bet_fraction    : full_kelly * kelly_fraction
+                            expected_value  : edge * decimal_odds
+                            recommendation  : str  (human-readable)
+      best_signal       : dict | None  — highest-edge signal, or None
+      value_bet_found   : bool
+    """
+    raw_probs = [1 / home_odds, 1 / draw_odds, 1 / away_odds]
+    overround = sum(raw_probs)
+    margin = round(overround - 1.0, 4)
+    fair_probs = [p / overround for p in raw_probs]
+
+    model_probs = [
+        matchup_result.get("home_win_prob", 0.0),
+        matchup_result.get("draw_prob", 0.0),
+        matchup_result.get("away_win_prob", 0.0),
+    ]
+    odds_list   = [home_odds, draw_odds, away_odds]
+    labels      = ["home", "draw", "away"]
+
+    signals = []
+    for label, mp, fp, dec_odds in zip(labels, model_probs, fair_probs, odds_list):
+        edge = round(mp - fp, 4)
+        if edge <= min_edge:
+            continue
+        b = dec_odds - 1.0
+        full_kelly = round(max(0.0, (b * mp - (1 - mp)) / b), 4)
+        bet_frac   = round(full_kelly * kelly_fraction, 4)
+        ev         = round(edge * dec_odds, 4)
+
+        if bet_frac > 0:
+            rec = (
+                f"BET {label.upper()}: stake {bet_frac*100:.1f}% of bankroll  "
+                f"(edge={edge:+.1%}, EV={ev:+.3f} per unit, "
+                f"fair odds={1/fp:.2f} vs market {dec_odds:.2f})"
+            )
+        else:
+            rec = f"Edge found ({edge:+.1%}) but Kelly=0 — skip."
+
+        signals.append({
+            "outcome":        label,
+            "model_prob":     round(mp,  4),
+            "fair_prob":      round(fp,  4),
+            "decimal_odds":   dec_odds,
+            "edge":           edge,
+            "full_kelly":     full_kelly,
+            "bet_fraction":   bet_frac,
+            "expected_value": ev,
+            "recommendation": rec,
+        })
+
+    signals.sort(key=lambda s: s["edge"], reverse=True)
+    best = signals[0] if signals else None
+
+    if best:
+        logger.info("Betting signal: %s", best["recommendation"])
+
+    return {
+        "bookmaker_margin": margin,
+        "signals":          signals,
+        "best_signal":      best,
+        "value_bet_found":  bool(signals),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 

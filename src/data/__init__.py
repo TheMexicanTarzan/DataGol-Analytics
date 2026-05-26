@@ -5,6 +5,7 @@ from .multi_tournament import COMPETITION_REGISTRY, MultiTournamentLoader
 from .odds_scraper import FootballDataScraper, OddsAPIScraper, remove_bookmaker_margin
 from .player_registry import PlayerRegistry
 from .quality_scraper import QualityScoreBuilder, SofascoreScraper, TransfermarktScraper
+from .statsbomb_scraper import STATSBOMB_COMPETITION_MAP, StatsBombScraper
 
 __all__ = [
     "COMPETITION_REGISTRY",
@@ -18,5 +19,7 @@ __all__ = [
     "QualityScoreBuilder",
     "remove_bookmaker_margin",
     "SofascoreScraper",
+    "STATSBOMB_COMPETITION_MAP",
+    "StatsBombScraper",
     "TransfermarktScraper",
 ]

@@ -80,11 +80,29 @@ STAT_TABLE_IDS: dict[str, str] = {
     "keeper_adv": "stats_keeper_adv",
 }
 
+# Cloudflare bypass: use cloudscraper if available, fall back to requests
+try:
+    import cloudscraper as _cloudscraper
+    _HAS_CLOUDSCRAPER = True
+except ImportError:
+    _HAS_CLOUDSCRAPER = False
+
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    )
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Referer": "https://fbref.com/en/",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Cache-Control": "max-age=0",
+    "DNT": "1",
 }
 
 
@@ -134,18 +152,47 @@ def _clean_player_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 class _DirectFBrefScraper:
-    """Scrapes FBref competition pages directly without third-party libraries."""
+    """
+    Scrapes FBref competition pages directly without third-party libraries.
 
-    def __init__(self, request_delay: float = 3.0):
+    Uses cloudscraper when available to bypass Cloudflare bot detection.
+    Falls back to a plain requests.Session with enhanced browser headers.
+    Retries up to 3 times with exponential back-off on transient errors.
+    """
+
+    def __init__(self, request_delay: float = 4.0):
         self._delay = request_delay
-        self._session = requests.Session()
+        if _HAS_CLOUDSCRAPER:
+            self._session = _cloudscraper.create_scraper(
+                browser={"browser": "chrome", "platform": "linux", "mobile": False}
+            )
+            logger.info("_DirectFBrefScraper: using cloudscraper for Cloudflare bypass.")
+        else:
+            logger.warning(
+                "_DirectFBrefScraper: cloudscraper not installed — direct requests "
+                "may be blocked by Cloudflare.  Run: pip install cloudscraper"
+            )
+            self._session = requests.Session()
         self._session.headers.update(_HEADERS)
 
     def _get(self, url: str) -> str:
-        time.sleep(self._delay)
-        resp = self._session.get(url, timeout=30)
-        resp.raise_for_status()
-        return resp.text
+        import random
+        for attempt in range(3):
+            jitter = random.uniform(0, 2.0)
+            time.sleep(self._delay + jitter)
+            try:
+                resp = self._session.get(url, timeout=30)
+                resp.raise_for_status()
+                return resp.text
+            except Exception as exc:
+                if attempt == 2:
+                    raise
+                wait = 2 ** attempt * 6  # 6s, 12s
+                logger.warning(
+                    "FBref request failed (attempt %d/3): %s — retrying in %ds",
+                    attempt + 1, exc, wait,
+                )
+                time.sleep(wait)
 
     def _scrape_stat_table(self, base_url: str, stat: str) -> pd.DataFrame:
         table_id = STAT_TABLE_IDS[stat]
@@ -368,7 +415,7 @@ class FBrefScraper:
         competition: CompetitionKey = "world_cup_2026",
         cache_dir: Path = Path("data/cache"),
         ttl_hours: int = 6,
-        request_delay: float = 3.0,
+        request_delay: float = 4.0,
     ):
         self.competition = competition
         self._cache = DataCache(cache_dir=cache_dir, ttl_hours=ttl_hours)
@@ -376,10 +423,17 @@ class FBrefScraper:
 
         try:
             self._soccerdata = _SoccerdataFBrefScraper()
-            logger.info("Using soccerdata as primary scraper.")
+            logger.info("Using soccerdata as primary FBref scraper.")
         except ImportError:
             self._soccerdata = None
             logger.info("soccerdata unavailable; using direct HTML scraper.")
+
+        # StatsBomb open data (free, no Cloudflare, preferred for supported tournaments)
+        try:
+            from .statsbomb_scraper import StatsBombScraper
+            self._statsbomb = StatsBombScraper(cache_dir=cache_dir, ttl_hours=720)
+        except Exception:
+            self._statsbomb = None
 
     # ------------------------------------------------------------------
 
@@ -410,15 +464,40 @@ class FBrefScraper:
 
     def get_merged_player_stats(self) -> pd.DataFrame:
         """
-        Convenience method that returns a single merged DataFrame.
-        Player name is the join key across all stat tables.
-        Cached independently for quick re-access.
+        Return a single merged player-stats DataFrame.
+
+        Source priority (first to succeed wins):
+          1. StatsBomb open data  — free, reliable, no Cloudflare;
+                                    available for copa_america_2024,
+                                    world_cup_2022, euro_2024, world_cup_2018.
+          2. soccerdata library   — wraps FBref; may hit Cloudflare.
+          3. Direct FBref HTML    — uses cloudscraper; last resort.
+
+        Results are cached to disk (TTL from constructor).
         """
         cache_key = f"{self.competition}_player_stats"
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
 
+        # 1. StatsBomb open data
+        if self._statsbomb and self._statsbomb.is_supported(self.competition):
+            try:
+                df = self._statsbomb.get_merged_player_stats(self.competition)
+                if not df.empty:
+                    logger.info(
+                        "get_merged_player_stats: using StatsBomb open data "
+                        "(%d players, %s).", len(df), self.competition
+                    )
+                    self._cache.set(cache_key, df)
+                    return df
+            except Exception as exc:
+                logger.warning(
+                    "StatsBomb failed for %s, falling back to FBref: %s",
+                    self.competition, exc,
+                )
+
+        # 2–3. FBref fallback chain
         raw = self.get_player_stats()
         merged = self._merge_stat_tables(raw)
         self._cache.set(cache_key, merged)

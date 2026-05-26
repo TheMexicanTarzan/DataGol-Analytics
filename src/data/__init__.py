@@ -1,3 +1,4 @@
+from .api_football_scraper import API_FOOTBALL_COMPETITION_MAP, APIFootballScraper
 from .cache import DataCache
 from .fbref_scraper import FBrefScraper
 from .feature_builder import PersonalityFeatureBuilder
@@ -8,6 +9,8 @@ from .quality_scraper import QualityScoreBuilder, SofascoreScraper, Transfermark
 from .statsbomb_scraper import STATSBOMB_COMPETITION_MAP, StatsBombScraper
 
 __all__ = [
+    "API_FOOTBALL_COMPETITION_MAP",
+    "APIFootballScraper",
     "COMPETITION_REGISTRY",
     "DataCache",
     "FBrefScraper",

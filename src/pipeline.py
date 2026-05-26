@@ -37,12 +37,15 @@ Quick start (notebook cell)
 """
 
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from .data import (
+    API_FOOTBALL_COMPETITION_MAP,
+    APIFootballScraper,
     COMPETITION_REGISTRY,
     DataCache,
     FBrefScraper,
@@ -240,16 +243,49 @@ def load_tournament_data(
     """
     Fetch, clean, and featurise all player data for the given tournament.
 
+    Source priority:
+      1. API-Football   — when API_FOOTBALL_KEY env var is set and the
+                          competition is in API_FOOTBALL_COMPETITION_MAP.
+      2. FBref/StatsBomb — fallback (StatsBomb open data for supported
+                           tournaments, direct FBref scraping otherwise).
+
     Returns
     -------
     model_df : pd.DataFrame
         Feature matrix (players × personality features), ready for clustering.
     lineups_df : pd.DataFrame
-        Long-format lineups: [match_url, side, player, ...].
+        Long-format lineups: [fixture_id/match_url, side, player, ...].
     """
-    scraper = FBrefScraper(competition=competition, cache_dir=cache_dir, ttl_hours=ttl_hours)
+    _load_env()
+
     builder = PersonalityFeatureBuilder()
     builder.MIN_MINUTES = min_minutes
+
+    api_key = os.environ.get("API_FOOTBALL_KEY", "")
+    if api_key and competition in API_FOOTBALL_COMPETITION_MAP:
+        logger.info("API-Football: fetching data for '%s' …", competition)
+        af = APIFootballScraper(cache_dir=cache_dir, ttl_hours=ttl_hours)
+        try:
+            merged_stats = af.get_merged_player_stats(competition)
+            model_df     = builder.build(merged_stats)
+
+            schedule     = af.get_schedule(competition)
+            fixture_ids  = (
+                schedule["fixture_id"].dropna().astype(int).tolist()
+                if not schedule.empty else []
+            )
+            lineups_df = af.get_all_lineups(fixture_ids)
+
+            logger.info(
+                "API-Football pipeline complete: %d players, %d lineup records.",
+                len(model_df), len(lineups_df),
+            )
+            return model_df, lineups_df
+        except Exception as exc:
+            logger.warning("API-Football failed (%s) — falling back to FBref/StatsBomb.", exc)
+
+    # Fallback: FBref (with StatsBomb open data for supported competitions)
+    scraper = FBrefScraper(competition=competition, cache_dir=cache_dir, ttl_hours=ttl_hours)
 
     logger.info("Fetching player stats for '%s' …", competition)
     merged_stats = scraper.get_merged_player_stats()
@@ -701,6 +737,15 @@ def _poisson_win_prob(lambda_a: float, lambda_b: float, max_goals: int = 10) -> 
         for b in range(0, a):
             prob += pmf(lambda_a, a) * pmf(lambda_b, b)
     return float(np.clip(prob, 0.0, 1.0))
+
+
+def _load_env() -> None:
+    """Load .env into os.environ if python-dotenv is installed."""
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
 
 
 def _extract_match_urls(schedule: pd.DataFrame) -> list[str]:
